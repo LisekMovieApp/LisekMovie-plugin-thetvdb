@@ -194,11 +194,27 @@ impl TvdbClient {
         *self.token.lock().await = None;
     }
 
-    /// Searches TVDB for a TV series by title, logging in for a bearer
-    /// token first if this client hasn't already cached one. Returns the
-    /// best (first, TVDB's own relevance-ranked) match, or `None` if TVDB
-    /// found nothing.
+    /// Searches TVDB for a TV series by title, across an increasingly loose
+    /// cascade of query candidates (see
+    /// [`lisek_plugin_api::query_candidates`]) — the plain normalized title
+    /// first, then a diacritics-stripped variant, then just its first two
+    /// words — stopping at the first candidate that finds anything. Logs in
+    /// for a bearer token first if this client hasn't already cached one
+    /// (shared across every candidate attempt — see [`Self::ensure_token`]).
     pub async fn search_series(&self, title: &str) -> Result<Option<TvdbSeriesMatch>, TvdbError> {
+        for candidate in lisek_plugin_api::query_candidates(title) {
+            if let Some(found) = self.search_series_once(&candidate).await? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One query-candidate's worth of searching, including the
+    /// token-refresh-on-401 retry — factored out of [`Self::search_series`]
+    /// so the query-candidate cascade there can call this once per
+    /// candidate.
+    async fn search_series_once(&self, title: &str) -> Result<Option<TvdbSeriesMatch>, TvdbError> {
         let token = self.ensure_token().await?;
         let mut response = self.search_request(&token, title).await?;
 
@@ -294,6 +310,14 @@ impl MetadataProvider for TvdbProvider {
         Ok(Some(ProviderMatch {
             poster_url: m.image_url.clone(),
             backdrop_url: None,
+            // TVDB v4 does have wide-banner and clear-logo artwork, but
+            // its artwork *type ids* are returned dynamically by
+            // `GET /artwork/types` rather than being fixed, documented
+            // constants the way TMDB's genre ids are — see
+            // `lisek_plugin_api::ProviderMatch`'s own doc comment. Left
+            // unset here rather than guessed at.
+            logo_url: None,
+            banner_url: None,
             fields: serde_json::json!({
                 "tvdb_id": m.tvdb_id,
                 "overview": m.overview,
@@ -325,7 +349,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/search"))
-            .and(query_param("query", "Breaking Bad"))
+            // Normalized (lowercased) by `query_candidates` before this
+            // client ever sees it — see `lisek-plugin-api`'s own tests.
+            .and(query_param("query", "breaking bad"))
             .and(query_param("type", "series"))
             .and(header("Authorization", "Bearer test-jwt-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -413,6 +439,47 @@ mod tests {
         let client = TvdbClient::with_base_url("test-key", server.uri());
         let result = client.search_series("Some Show").await;
         assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn search_series_falls_back_to_the_first_two_words_once_the_full_title_finds_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(login_mock_success())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("query", "a very obscure show title"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        // "a very" — the first two words — is what actually finds it.
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("query", "a very"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "tvdb_id": "12345",
+                    "name": "A Very Obscure Show",
+                    "overview": "It exists.",
+                    "image_url": "https://artworks.thetvdb.com/banners/posters/12345-1.jpg",
+                    "year": "2019"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TvdbClient::with_base_url("test-key", server.uri());
+        let result = client
+            .search_series("A Very Obscure Show Title")
+            .await
+            .unwrap();
+
+        assert_eq!(result.map(|m| m.tvdb_id), Some("12345".to_string()));
     }
 
     #[tokio::test]
