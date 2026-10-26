@@ -32,7 +32,10 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lisek_plugin_api::{MetadataProvider, MovieQuery, ProviderError, ProviderMatch, SeriesQuery};
+use lisek_plugin_api::{
+    MediaKind, MetadataProvider, MovieQuery, ProviderCandidate, ProviderError, ProviderMatch,
+    SeriesQuery,
+};
 use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
@@ -103,6 +106,39 @@ struct RawSearchResult {
     overview: Option<String>,
     image_url: Option<String>,
     year: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataResponse<T> {
+    data: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSeriesRecord {
+    id: u64,
+    #[serde(default)]
+    name: String,
+    image: Option<String>,
+    year: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTranslation {
+    overview: Option<String>,
+}
+
+/// TVDB names languages with three letters.
+fn tvdb_language(primary_language: &str) -> &'static str {
+    match primary_language.split(['-', '_']).next().unwrap_or("") {
+        "pl" => "pol",
+        "de" => "deu",
+        "fr" => "fra",
+        "es" => "spa",
+        "it" => "ita",
+        "cs" => "ces",
+        "ja" => "jpn",
+        _ => "eng",
+    }
 }
 
 static FOUR_DIGIT_YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{4}$").unwrap());
@@ -244,6 +280,95 @@ impl TvdbClient {
             .transpose()
     }
 
+    /// One authorized GET (with the same retry-once-after-401 as
+    /// searching). `Ok(None)` for a 404.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<T>, TvdbError> {
+        let send = |token: String| {
+            self.http
+                .get(format!("{}{path}", self.base_url))
+                .bearer_auth(token)
+                .query(query)
+                .send()
+        };
+        let mut response = send(self.ensure_token().await?).await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.clear_token().await;
+            response = send(self.ensure_token().await?).await?;
+        }
+        match response.status() {
+            reqwest::StatusCode::UNAUTHORIZED => return Err(TvdbError::Unauthorized),
+            reqwest::StatusCode::NOT_FOUND => return Ok(None),
+            _ => {}
+        }
+        let body = response
+            .error_for_status()?
+            .json()
+            .await
+            .map_err(|err| TvdbError::UnexpectedResponse(err.to_string()))?;
+        Ok(Some(body))
+    }
+
+    /// Every series result for one exact query ("Fix match"), best first.
+    pub async fn search_series_results(
+        &self,
+        title: &str,
+        year: Option<i32>,
+    ) -> Result<Vec<TvdbSeriesMatch>, TvdbError> {
+        let year = year.map(|y| y.to_string());
+        let mut query = vec![("query", title), ("type", "series")];
+        if let Some(year) = year.as_deref() {
+            query.push(("year", year));
+        }
+        let body: Option<TvdbSearchResponse> = self.get_json("/search", &query).await?;
+        body.map(|b| b.data)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|raw| TvdbSeriesMatch::try_from(raw).ok())
+            .map(Ok)
+            .collect()
+    }
+
+    /// One series by its TVDB id, with the overview in `language` (TVDB's
+    /// three-letter code, e.g. `pol`) when TVDB has that translation, else
+    /// English. `Ok(None)` for an unknown id.
+    pub async fn series_by_id(
+        &self,
+        tvdb_id: &str,
+        language: &str,
+    ) -> Result<Option<TvdbSeriesMatch>, TvdbError> {
+        let Some(body): Option<DataResponse<RawSeriesRecord>> =
+            self.get_json(&format!("/series/{tvdb_id}"), &[]).await?
+        else {
+            return Ok(None);
+        };
+        let record = body.data;
+        let mut overview = String::new();
+        for lang in [language, "eng"] {
+            let translation: Option<DataResponse<RawTranslation>> = self
+                .get_json(&format!("/series/{tvdb_id}/translations/{lang}"), &[])
+                .await
+                .unwrap_or(None);
+            if let Some(text) = translation.and_then(|t| t.data.overview).filter(|o| !o.is_empty()) {
+                overview = text;
+                break;
+            }
+        }
+        Ok(Some(TvdbSeriesMatch {
+            tvdb_id: record.id.to_string(),
+            title: record.name,
+            overview,
+            image_url: record.image,
+            year: record
+                .year
+                .filter(|y| FOUR_DIGIT_YEAR.is_match(y))
+                .and_then(|y| y.parse().ok()),
+        }))
+    }
+
     async fn search_request(
         &self,
         token: &str,
@@ -265,12 +390,19 @@ impl TvdbClient {
 /// doc comment for the compile-time-extension architecture this fits into.
 pub struct TvdbProvider {
     api_key: String,
+    base_url: String,
 }
 
 impl TvdbProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_base_url(api_key, DEFAULT_BASE_URL)
+    }
+
+    /// Tests point the provider at a mock server.
+    pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
+            base_url: base_url.into(),
         }
     }
 }
@@ -303,7 +435,7 @@ impl MetadataProvider for TvdbProvider {
         query: &SeriesQuery<'_>,
         _primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
-        let client = TvdbClient::new(self.api_key.clone());
+        let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
         let Some(m) = client.search_series(query.title).await? else {
             return Ok(None);
         };
@@ -318,9 +450,66 @@ impl MetadataProvider for TvdbProvider {
             // unset here rather than guessed at.
             logo_url: None,
             banner_url: None,
+            // TheTVDB credits are not read (yet).
+            people: None,
             fields: serde_json::json!({
                 "tvdb_id": m.tvdb_id,
                 "overview": m.overview,
+            }),
+        }))
+    }
+
+    async fn search(
+        &self,
+        kind: MediaKind,
+        title: &str,
+        year: Option<i32>,
+        _primary_language: &str,
+    ) -> Result<Vec<ProviderCandidate>, ProviderError> {
+        if kind != MediaKind::Series {
+            return Ok(Vec::new());
+        }
+        let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
+        Ok(client
+            .search_series_results(title, year)
+            .await?
+            .into_iter()
+            .take(10)
+            .map(|m| ProviderCandidate {
+                provider_id: m.tvdb_id,
+                title: m.title,
+                year: m.year,
+                overview: m.overview,
+                poster_url: m.image_url,
+            })
+            .collect())
+    }
+
+    async fn lookup(
+        &self,
+        kind: MediaKind,
+        provider_id: &str,
+        primary_language: &str,
+    ) -> Result<Option<ProviderMatch>, ProviderError> {
+        if kind != MediaKind::Series || !provider_id.chars().all(|c| c.is_ascii_digit()) || provider_id.is_empty() {
+            return Ok(None);
+        }
+        let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
+        let Some(m) = client.series_by_id(provider_id, tvdb_language(primary_language)).await? else {
+            return Ok(None);
+        };
+        Ok(Some(ProviderMatch {
+            poster_url: m.image_url.clone(),
+            backdrop_url: None,
+            logo_url: None,
+            banner_url: None,
+            // TheTVDB credits are not read (yet).
+            people: None,
+            fields: serde_json::json!({
+                "tvdb_id": m.tvdb_id,
+                "overview": m.overview,
+                "title": m.title,
+                "year": m.year,
             }),
         }))
     }
@@ -536,5 +725,72 @@ mod tests {
     #[test]
     fn provider_key_is_tvdb() {
         assert_eq!(TvdbProvider::new("k").provider_key(), "tvdb");
+    }
+
+    #[tokio::test]
+    async fn fix_match_search_and_lookup_by_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(login_mock_success())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("query", "Inazuma Eleven"))
+            .and(query_param("year", "2008"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "tvdb_id": "81797", "name": "Inazuma Eleven", "year": "2008", "image_url": "https://img/ie.jpg" },
+                    { "name": "no id, skipped" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/series/81797"))
+            .and(header("Authorization", "Bearer test-jwt-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "id": 81797, "name": "Inazuma Eleven", "image": "https://img/ie.jpg", "year": "2008" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/series/81797/translations/pol"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/series/81797/translations/eng"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "overview": "Soccer!" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/series/1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = TvdbProvider::with_base_url("k", server.uri());
+        let found = provider.search(MediaKind::Series, "Inazuma Eleven", Some(2008), "pl").await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].provider_id.as_str(), found[0].year), ("81797", Some(2008)));
+        assert!(provider.search(MediaKind::Movie, "x", None, "pl").await.unwrap().is_empty());
+
+        let matched = provider.lookup(MediaKind::Series, "81797", "pl").await.unwrap().unwrap();
+        assert_eq!(matched.fields["title"], "Inazuma Eleven");
+        assert_eq!(matched.fields["overview"], "Soccer!");
+        assert_eq!(matched.fields["year"], 2008);
+        assert_eq!(matched.poster_url.as_deref(), Some("https://img/ie.jpg"));
+        assert!(provider.lookup(MediaKind::Series, "1", "pl").await.unwrap().is_none());
+        assert!(provider.lookup(MediaKind::Series, "../x", "pl").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn languages_map_to_tvdb_codes() {
+        assert_eq!(tvdb_language("pl"), "pol");
+        assert_eq!(tvdb_language("pt-BR"), "eng");
     }
 }
