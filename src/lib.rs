@@ -452,6 +452,7 @@ impl MetadataProvider for TvdbProvider {
             banner_url: None,
             // TheTVDB credits are not read (yet).
             people: None,
+            seasons: Vec::new(),
             fields: serde_json::json!({
                 "tvdb_id": m.tvdb_id,
                 "overview": m.overview,
@@ -505,6 +506,7 @@ impl MetadataProvider for TvdbProvider {
             banner_url: None,
             // TheTVDB credits are not read (yet).
             people: None,
+            seasons: Vec::new(),
             fields: serde_json::json!({
                 "tvdb_id": m.tvdb_id,
                 "overview": m.overview,
