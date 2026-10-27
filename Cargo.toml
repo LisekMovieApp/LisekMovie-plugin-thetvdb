@@ -3,7 +3,7 @@ name = "lisek-plugin-thetvdb"
 description = "TheTVDB metadata provider extension for LisekMovie."
 version = "1.0.0-beta"
 edition = "2024"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "MIT"
 
 [dependencies]
 lisek-plugin-api = { path = "../LisekMovie-app/LisekMovie-Backend/lisek-plugin-api" }

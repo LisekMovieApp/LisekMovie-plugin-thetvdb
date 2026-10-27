@@ -24,9 +24,8 @@
 //! documentation; a first real scan with a configured key is what gives
 //! that its final live confirmation.
 //!
-//! TVDB has no movie search wired up in this pass (its v4 movie endpoints
-//! exist but aren't covered here — TMDB alone covers movies for now); see
-//! [`TvdbProvider::find_movie`].
+//! Films (Faza 18) use the same flow with `type=movie` searches,
+//! `/movies/{id}` records and `{ movie }` remote ids.
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -125,6 +124,48 @@ struct RawSeriesRecord {
 #[derive(Debug, Deserialize)]
 struct RawTranslation {
     overview: Option<String>,
+}
+
+/// `type=` of `/search` for an item kind.
+fn search_type(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Series => "series",
+        MediaKind::Movie => "movie",
+    }
+}
+
+/// The record collection of an item kind: `/series/{id}`, `/movies/{id}`.
+fn record_path(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Series => "series",
+        MediaKind::Movie => "movies",
+    }
+}
+
+/// Fields of a match: `tvdb_id`, the overview, and (lookups) the title and
+/// year.
+fn match_from(m: &TvdbSeriesMatch, with_title: bool) -> ProviderMatch {
+    let mut fields = serde_json::json!({
+        "tvdb_id": m.tvdb_id,
+        "overview": m.overview,
+    });
+    if with_title {
+        fields["title"] = serde_json::json!(m.title);
+        fields["year"] = serde_json::json!(m.year);
+    }
+    ProviderMatch {
+        poster_url: m.image_url.clone(),
+        // TVDB v4 has wide-banner and clear-logo artwork, but its artwork
+        // type ids come from `GET /artwork/types` rather than fixed
+        // constants — see `lisek_plugin_api::ProviderMatch`. Left unset.
+        backdrop_url: None,
+        logo_url: None,
+        banner_url: None,
+        // TheTVDB credits are not read (yet).
+        people: None,
+        seasons: Vec::new(),
+        fields,
+    }
 }
 
 /// TVDB names languages with three letters.
@@ -318,8 +359,19 @@ impl TvdbClient {
         title: &str,
         year: Option<i32>,
     ) -> Result<Vec<TvdbSeriesMatch>, TvdbError> {
+        self.search_results(MediaKind::Series, title, year).await
+    }
+
+    /// Every result of one kind (`type=series` or `type=movie`) for one
+    /// exact query, best first.
+    pub async fn search_results(
+        &self,
+        kind: MediaKind,
+        title: &str,
+        year: Option<i32>,
+    ) -> Result<Vec<TvdbSeriesMatch>, TvdbError> {
         let year = year.map(|y| y.to_string());
-        let mut query = vec![("query", title), ("type", "series")];
+        let mut query = vec![("query", title), ("type", search_type(kind))];
         if let Some(year) = year.as_deref() {
             query.push(("year", year));
         }
@@ -340,8 +392,21 @@ impl TvdbClient {
         tvdb_id: &str,
         language: &str,
     ) -> Result<Option<TvdbSeriesMatch>, TvdbError> {
+        self.record_by_id(MediaKind::Series, tvdb_id, language).await
+    }
+
+    /// One series (`/series/{id}`) or film (`/movies/{id}`) by its TVDB id,
+    /// with the overview in `language` when TVDB has that translation, else
+    /// English. `Ok(None)` for an unknown id.
+    pub async fn record_by_id(
+        &self,
+        kind: MediaKind,
+        tvdb_id: &str,
+        language: &str,
+    ) -> Result<Option<TvdbSeriesMatch>, TvdbError> {
+        let collection = record_path(kind);
         let Some(body): Option<DataResponse<RawSeriesRecord>> =
-            self.get_json(&format!("/series/{tvdb_id}"), &[]).await?
+            self.get_json(&format!("/{collection}/{tvdb_id}"), &[]).await?
         else {
             return Ok(None);
         };
@@ -349,7 +414,7 @@ impl TvdbClient {
         let mut overview = String::new();
         for lang in [language, "eng"] {
             let translation: Option<DataResponse<RawTranslation>> = self
-                .get_json(&format!("/series/{tvdb_id}/translations/{lang}"), &[])
+                .get_json(&format!("/{collection}/{tvdb_id}/translations/{lang}"), &[])
                 .await
                 .unwrap_or(None);
             if let Some(text) = translation.and_then(|t| t.data.overview).filter(|o| !o.is_empty()) {
@@ -372,6 +437,13 @@ impl TvdbClient {
     /// The TVDB id of the series with this IMDb id
     /// (`/search/remoteid/{id}`). `Ok(None)`: TVDB has no series for it.
     pub async fn series_id_by_imdb_id(&self, imdb_id: &str) -> Result<Option<String>, TvdbError> {
+        self.id_by_imdb_id(MediaKind::Series, imdb_id).await
+    }
+
+    /// The TVDB id of the series or film with this IMDb id
+    /// (`/search/remoteid/{id}` answers `{ series }` or `{ movie }`
+    /// records). `Ok(None)`: TVDB has none of that kind for it.
+    pub async fn id_by_imdb_id(&self, kind: MediaKind, imdb_id: &str) -> Result<Option<String>, TvdbError> {
         #[derive(Deserialize)]
         struct Record {
             id: u64,
@@ -379,12 +451,37 @@ impl TvdbClient {
         #[derive(Deserialize)]
         struct RemoteResult {
             series: Option<Record>,
+            movie: Option<Record>,
         }
         let body: Option<DataResponse<Vec<RemoteResult>>> =
             self.get_json(&format!("/search/remoteid/{imdb_id}"), &[]).await?;
         Ok(body
-            .and_then(|b| b.data.into_iter().find_map(|r| r.series))
-            .map(|series| series.id.to_string()))
+            .and_then(|b| {
+                b.data.into_iter().find_map(|r| match kind {
+                    MediaKind::Series => r.series,
+                    MediaKind::Movie => r.movie,
+                })
+            })
+            .map(|record| record.id.to_string()))
+    }
+
+    /// The best film for a scanned title: the query-candidate cascade of
+    /// [`Self::search_series`], with the year first and then without it.
+    pub async fn search_movie(&self, title: &str, year: Option<i32>) -> Result<Option<TvdbSeriesMatch>, TvdbError> {
+        for candidate in lisek_plugin_api::query_candidates(title) {
+            let years = if year.is_some() { vec![year, None] } else { vec![None] };
+            for year in years {
+                if let Some(found) = self
+                    .search_results(MediaKind::Movie, &candidate, year)
+                    .await?
+                    .into_iter()
+                    .next()
+                {
+                    return Ok(Some(found));
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn search_request(
@@ -431,17 +528,18 @@ impl MetadataProvider for TvdbProvider {
         "tvdb"
     }
 
-    /// TVDB's v4 movie search exists but isn't wired up in this pass — see
-    /// this crate's own doc comment. `Ok(None)` here is indistinguishable
-    /// to the caller from "TVDB covers movies but didn't recognize this
-    /// title", which is exactly the point (see `MetadataProvider`'s doc
-    /// comment in `lisek-plugin-api`).
+    /// Films through `/search?type=movie` (Faza 18; earlier versions
+    /// answered series only).
     async fn find_movie(
         &self,
-        _query: &MovieQuery<'_>,
+        query: &MovieQuery<'_>,
         _primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
-        Ok(None)
+        let client = self.client();
+        Ok(client
+            .search_movie(query.title, query.year)
+            .await?
+            .map(|m| match_from(&m, false)))
     }
 
     /// TVDB has no per-language `/images` endpoint equivalent to TMDB's, so
@@ -453,29 +551,11 @@ impl MetadataProvider for TvdbProvider {
         query: &SeriesQuery<'_>,
         _primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
-        let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
-        let Some(m) = client.search_series(query.title).await? else {
-            return Ok(None);
-        };
-        Ok(Some(ProviderMatch {
-            poster_url: m.image_url.clone(),
-            backdrop_url: None,
-            // TVDB v4 does have wide-banner and clear-logo artwork, but
-            // its artwork *type ids* are returned dynamically by
-            // `GET /artwork/types` rather than being fixed, documented
-            // constants the way TMDB's genre ids are — see
-            // `lisek_plugin_api::ProviderMatch`'s own doc comment. Left
-            // unset here rather than guessed at.
-            logo_url: None,
-            banner_url: None,
-            // TheTVDB credits are not read (yet).
-            people: None,
-            seasons: Vec::new(),
-            fields: serde_json::json!({
-                "tvdb_id": m.tvdb_id,
-                "overview": m.overview,
-            }),
-        }))
+        let client = self.client();
+        Ok(client
+            .search_series(query.title)
+            .await?
+            .map(|m| match_from(&m, false)))
     }
 
     async fn search(
@@ -485,12 +565,9 @@ impl MetadataProvider for TvdbProvider {
         year: Option<i32>,
         _primary_language: &str,
     ) -> Result<Vec<ProviderCandidate>, ProviderError> {
-        if kind != MediaKind::Series {
-            return Ok(Vec::new());
-        }
-        let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
-        Ok(client
-            .search_series_results(title, year)
+        Ok(self
+            .client()
+            .search_results(kind, title, year)
             .await?
             .into_iter()
             .take(10)
@@ -504,60 +581,49 @@ impl MetadataProvider for TvdbProvider {
             .collect())
     }
 
-    /// TVDB ids as they are, IMDb ids through TVDB's remote ids.
-    async fn lookup_by_id(
-        &self,
-        kind: MediaKind,
-        id: &DirectId,
-        primary_language: &str,
-    ) -> Result<Option<ProviderCandidate>, ProviderError> {
-        if kind != MediaKind::Series {
-            return Ok(None);
-        }
-        let tvdb_id = match id {
-            DirectId::Numeric(own) => own.clone(),
-            DirectId::Imdb(imdb) => {
-                let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
-                match client.series_id_by_imdb_id(imdb).await? {
-                    Some(found) => found,
-                    None => return Ok(None),
-                }
-            }
-        };
-        Ok(self
-            .lookup(kind, &tvdb_id, primary_language)
-            .await?
-            .and_then(|matched| ProviderCandidate::from_match(&tvdb_id, &matched)))
-    }
-
+    /// A series id at `/series/{id}`, a film id at `/movies/{id}`.
     async fn lookup(
         &self,
         kind: MediaKind,
         provider_id: &str,
         primary_language: &str,
     ) -> Result<Option<ProviderMatch>, ProviderError> {
-        if kind != MediaKind::Series || !provider_id.chars().all(|c| c.is_ascii_digit()) || provider_id.is_empty() {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() || !provider_id.chars().all(|c| c.is_ascii_digit()) {
             return Ok(None);
         }
-        let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
-        let Some(m) = client.series_by_id(provider_id, tvdb_language(primary_language)).await? else {
-            return Ok(None);
+        Ok(self
+            .client()
+            .record_by_id(kind, provider_id, tvdb_language(primary_language))
+            .await?
+            .map(|m| match_from(&m, true)))
+    }
+
+    /// TVDB ids as they are, IMDb ids through TVDB's remote ids — series
+    /// or films, as asked.
+    async fn lookup_by_id(
+        &self,
+        kind: MediaKind,
+        id: &DirectId,
+        primary_language: &str,
+    ) -> Result<Option<ProviderCandidate>, ProviderError> {
+        let tvdb_id = match id {
+            DirectId::Numeric(own) => own.clone(),
+            DirectId::Imdb(imdb) => match self.client().id_by_imdb_id(kind, imdb).await? {
+                Some(found) => found,
+                None => return Ok(None),
+            },
         };
-        Ok(Some(ProviderMatch {
-            poster_url: m.image_url.clone(),
-            backdrop_url: None,
-            logo_url: None,
-            banner_url: None,
-            // TheTVDB credits are not read (yet).
-            people: None,
-            seasons: Vec::new(),
-            fields: serde_json::json!({
-                "tvdb_id": m.tvdb_id,
-                "overview": m.overview,
-                "title": m.title,
-                "year": m.year,
-            }),
-        }))
+        Ok(self
+            .lookup(kind, &tvdb_id, primary_language)
+            .await?
+            .and_then(|matched| ProviderCandidate::from_match(&tvdb_id, &matched)))
+    }
+}
+
+impl TvdbProvider {
+    fn client(&self) -> TvdbClient {
+        TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone())
     }
 }
 
@@ -752,22 +818,6 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    #[tokio::test]
-    async fn provider_movie_lookup_always_returns_none() {
-        let provider = TvdbProvider::new("test-key");
-        let result = provider
-            .find_movie(
-                &MovieQuery {
-                    title: "Anything",
-                    year: None,
-                },
-                "en",
-            )
-            .await
-            .unwrap();
-        assert_eq!(result, None);
-    }
-
     #[test]
     fn provider_key_is_tvdb() {
         assert_eq!(TvdbProvider::new("k").provider_key(), "tvdb");
@@ -884,6 +934,82 @@ mod tests {
         // Films are not looked up on TVDB.
         let movie = DirectId::Imdb("tt0903747".into());
         assert!(provider.lookup_by_id(MediaKind::Movie, &movie, "pl").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn films_use_the_movie_endpoints() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(login_mock_success())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("type", "movie"))
+            .and(query_param("query", "dune"))
+            .and(query_param("year", "2021"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .and(query_param("type", "movie"))
+            .and(query_param("query", "dune"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "tvdb_id": "375507", "name": "Dune", "year": "2021", "image_url": "https://img/dune.jpg", "overview": "Arrakis." }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movies/375507"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "id": 375507, "name": "Dune", "image": "https://img/dune.jpg", "year": "2021" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/movies/375507/translations/pol"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "overview": "Diuna." }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/remoteid/tt1160419"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "movie": { "id": 375507 } }]
+            })))
+            .mount(&server)
+            .await;
+        let provider = TvdbProvider::with_base_url("k", server.uri());
+
+        // The scanner: the year finds nothing, the search without it does.
+        let matched = provider
+            .find_movie(&MovieQuery { title: "Dune", year: Some(2021) }, "pl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((matched.fields["tvdb_id"].as_str(), matched.fields["overview"].as_str()), (Some("375507"), Some("Arrakis.")));
+
+        let found = provider.search(MediaKind::Movie, "dune", None, "pl").await.unwrap();
+        assert_eq!((found[0].provider_id.as_str(), found[0].year), ("375507", Some(2021)));
+
+        // Fix match with the TVDB film id (and with its IMDb id).
+        let by_id = provider
+            .lookup_by_id(MediaKind::Movie, &DirectId::Numeric("375507".into()), "pl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((by_id.title.as_str(), by_id.year, by_id.overview.as_str()), ("Dune", Some(2021), "Diuna."));
+        let by_imdb = provider
+            .lookup_by_id(MediaKind::Movie, &DirectId::Imdb("tt1160419".into()), "pl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_imdb.provider_id, "375507");
+        // The same number is no series.
+        assert!(provider.lookup(MediaKind::Series, "375507", "pl").await.unwrap().is_none());
     }
 
     #[test]
