@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lisek_plugin_api::{
-    MediaKind, MetadataProvider, MovieQuery, ProviderCandidate, ProviderError, ProviderMatch,
+    DirectId, MediaKind, MetadataProvider, MovieQuery, ProviderCandidate, ProviderError, ProviderMatch,
     SeriesQuery,
 };
 use regex::Regex;
@@ -369,6 +369,24 @@ impl TvdbClient {
         }))
     }
 
+    /// The TVDB id of the series with this IMDb id
+    /// (`/search/remoteid/{id}`). `Ok(None)`: TVDB has no series for it.
+    pub async fn series_id_by_imdb_id(&self, imdb_id: &str) -> Result<Option<String>, TvdbError> {
+        #[derive(Deserialize)]
+        struct Record {
+            id: u64,
+        }
+        #[derive(Deserialize)]
+        struct RemoteResult {
+            series: Option<Record>,
+        }
+        let body: Option<DataResponse<Vec<RemoteResult>>> =
+            self.get_json(&format!("/search/remoteid/{imdb_id}"), &[]).await?;
+        Ok(body
+            .and_then(|b| b.data.into_iter().find_map(|r| r.series))
+            .map(|series| series.id.to_string()))
+    }
+
     async fn search_request(
         &self,
         token: &str,
@@ -484,6 +502,32 @@ impl MetadataProvider for TvdbProvider {
                 poster_url: m.image_url,
             })
             .collect())
+    }
+
+    /// TVDB ids as they are, IMDb ids through TVDB's remote ids.
+    async fn lookup_by_id(
+        &self,
+        kind: MediaKind,
+        id: &DirectId,
+        primary_language: &str,
+    ) -> Result<Option<ProviderCandidate>, ProviderError> {
+        if kind != MediaKind::Series {
+            return Ok(None);
+        }
+        let tvdb_id = match id {
+            DirectId::Numeric(own) => own.clone(),
+            DirectId::Imdb(imdb) => {
+                let client = TvdbClient::with_base_url(self.api_key.clone(), self.base_url.clone());
+                match client.series_id_by_imdb_id(imdb).await? {
+                    Some(found) => found,
+                    None => return Ok(None),
+                }
+            }
+        };
+        Ok(self
+            .lookup(kind, &tvdb_id, primary_language)
+            .await?
+            .and_then(|matched| ProviderCandidate::from_match(&tvdb_id, &matched)))
     }
 
     async fn lookup(
@@ -788,6 +832,58 @@ mod tests {
         assert_eq!(matched.poster_url.as_deref(), Some("https://img/ie.jpg"));
         assert!(provider.lookup(MediaKind::Series, "1", "pl").await.unwrap().is_none());
         assert!(provider.lookup(MediaKind::Series, "../x", "pl").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_imdb_id_is_resolved_through_the_remote_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(login_mock_success())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/remoteid/tt0903747"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "series": { "id": 81189, "name": "Breaking Bad" } }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/remoteid/tt0000001"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/series/81189"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "id": 81189, "name": "Breaking Bad", "year": "2008" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/series/81189/translations/pol"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/series/81189/translations/eng"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = TvdbProvider::with_base_url("k", server.uri());
+        let found = provider
+            .lookup_by_id(MediaKind::Series, &DirectId::Imdb("tt0903747".into()), "pl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((found.provider_id.as_str(), found.title.as_str(), found.year), ("81189", "Breaking Bad", Some(2008)));
+        let unknown = DirectId::Imdb("tt0000001".into());
+        assert!(provider.lookup_by_id(MediaKind::Series, &unknown, "pl").await.unwrap().is_none());
+        // Films are not looked up on TVDB.
+        let movie = DirectId::Imdb("tt0903747".into());
+        assert!(provider.lookup_by_id(MediaKind::Movie, &movie, "pl").await.unwrap().is_none());
     }
 
     #[test]

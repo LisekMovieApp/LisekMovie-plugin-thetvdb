@@ -1,0 +1,41 @@
+# Builds and tests this provider extension against the plugin API of
+# LisekMovie-app (a path dependency: `../LisekMovie-app/...`), so both
+# repositories are checked out side by side.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: ${{ github.event.repository.name }}
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/LisekMovie-app
+          path: LisekMovie-app
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ github.event.repository.name }}
+      - name: Clippy
+        working-directory: ${{ github.event.repository.name }}
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        working-directory: ${{ github.event.repository.name }}
+        run: cargo test
